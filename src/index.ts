@@ -62,6 +62,7 @@ let relayRequestOrigin: Map<string, WebSocket> = new Map();
 // ─── Secondary-mode state ───────────────────────────────────────────────────────
 let relaySocket: WebSocket | null = null;
 let secondaryResponseResolvers: Map<string, (data: any) => void> = new Map();
+let primaryHousekeepingInterval: NodeJS.Timeout | null = null;
 
 // ─── Status page HTML ───────────────────────────────────────────────────────────
 const STATUS_PAGE_HTML = `
@@ -944,8 +945,68 @@ function unregisterClient(clientId: string) {
   if (entry?.ws) {
     wsToClientId.delete(entry.ws);
   }
+  if (entry) {
+    entry.pendingHttpCommand = null;
+  }
+
+  for (const [requestId, mappedClientId] of requestToClientId.entries()) {
+    if (mappedClientId !== clientId) {
+      continue;
+    }
+
+    requestToClientId.delete(requestId);
+
+    const originRelay = relayRequestOrigin.get(requestId);
+    if (originRelay && originRelay.readyState === WebSocket.OPEN) {
+      originRelay.send(
+        JSON.stringify({
+          id: requestId,
+          output: undefined,
+          error: `Roblox client ${clientId} disconnected before responding.`,
+        })
+      );
+    }
+    relayRequestOrigin.delete(requestId);
+
+    const resolver = httpResponseResolvers.get(requestId);
+    if (resolver) {
+      httpResponseResolvers.delete(requestId);
+      resolver({
+        id: requestId,
+        output: undefined,
+        error: `Roblox client ${clientId} disconnected before responding.`,
+      });
+    }
+  }
+
   clientRegistry.delete(clientId);
   console.error(`[Registry] Client unregistered: ${clientId}`);
+}
+
+function pruneStaleClients() {
+  const now = Date.now();
+  for (const [clientId, entry] of clientRegistry.entries()) {
+    if (entry.transport !== "http") {
+      continue;
+    }
+
+    if (now - entry.lastHttpPoll < HTTP_POLL_TIMEOUT) {
+      continue;
+    }
+
+    unregisterClient(clientId);
+  }
+}
+
+function resetPrimaryHousekeeping() {
+  if (primaryHousekeepingInterval) {
+    clearInterval(primaryHousekeepingInterval);
+    primaryHousekeepingInterval = null;
+  }
+
+  primaryHousekeepingInterval = setInterval(() => {
+    pruneStaleClients();
+  }, Math.max(1000, Math.floor(HTTP_POLL_TIMEOUT / 2)));
 }
 
 function getActiveClients(): RobloxClient[] {
@@ -1096,6 +1157,11 @@ function SendArbitraryDataToClient(
 function startAsPrimary(): Promise<void> {
   return new Promise((resolve, reject) => {
     instanceRole = "primary";
+
+    if (primaryHousekeepingInterval) {
+      clearInterval(primaryHousekeepingInterval);
+      primaryHousekeepingInterval = null;
+    }
 
     // Reset primary state
     clientRegistry = new Map();
@@ -1309,6 +1375,8 @@ function startAsPrimary(): Promise<void> {
       console.error(
         `[Primary] MCP Bridge listening on port ${WS_PORT} (WebSocket + HTTP)`
       );
+
+      resetPrimaryHousekeeping();
 
       wss = new WebSocketServer({ server: httpServer! });
 

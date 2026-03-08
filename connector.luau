@@ -6,6 +6,66 @@ end
 --// Variables \\--
 local BridgeURL = getgenv().BridgeURL or ... or "localhost:16384"
 
+local ExistingConnectorRuntime = getgenv().__RobloxMCPConnectorState
+if typeof(ExistingConnectorRuntime) == "table" and type(ExistingConnectorRuntime.Stop) == "function" then
+    pcall(ExistingConnectorRuntime.Stop, "restart")
+end
+
+local ConnectorRuntime = {
+    Running = true,
+    ActiveBridge = nil,
+    Connections = {},
+    Threads = {},
+}
+
+getgenv().__RobloxMCPConnectorState = ConnectorRuntime
+
+local function IsConnectorActive()
+    return ConnectorRuntime.Running and getgenv().__RobloxMCPConnectorState == ConnectorRuntime
+end
+
+local function TrackRuntimeConnection(connection)
+    if connection then
+        table.insert(ConnectorRuntime.Connections, connection)
+    end
+    return connection
+end
+
+local function TrackRuntimeThread(thread)
+    if thread then
+        table.insert(ConnectorRuntime.Threads, thread)
+    end
+    return thread
+end
+
+local function StopConnector(_reason)
+    if not ConnectorRuntime.Running then
+        return
+    end
+
+    ConnectorRuntime.Running = false
+
+    if ConnectorRuntime.ActiveBridge and ConnectorRuntime.ActiveBridge.Destroy then
+        pcall(function()
+            ConnectorRuntime.ActiveBridge:Destroy()
+        end)
+    end
+
+    for _, connection in ConnectorRuntime.Connections do
+        pcall(function()
+            connection:Disconnect()
+        end)
+    end
+    table.clear(ConnectorRuntime.Connections)
+
+    for _, thread in ConnectorRuntime.Threads do
+        pcall(task.cancel, thread)
+    end
+    table.clear(ConnectorRuntime.Threads)
+end
+
+ConnectorRuntime.Stop = StopConnector
+
 --// Libraries \\--
 -- Lua 5.1+ base64 v3.0 (c) 2009 by Alex Kloss <alexthkloss@web.de>
 -- licensed under the terms of the LGPL2
@@ -97,6 +157,22 @@ end
 --// Base Bridge Class \\--
 local BaseBridge = {}; do
     BaseBridge.__index = BaseBridge
+
+    function BaseBridge:TrackConnection(connection)
+        self.Connections = self.Connections or {}
+        if connection then
+            table.insert(self.Connections, connection)
+        end
+        return connection
+    end
+
+    function BaseBridge:TrackThread(thread)
+        self.Threads = self.Threads or {}
+        if thread then
+            table.insert(self.Threads, thread)
+        end
+        return thread
+    end
     
     function BaseBridge:BindToType(type, callback)
         self.Callbacks[type] = callback
@@ -138,6 +214,32 @@ local BaseBridge = {}; do
             success = true,
             id = id
         }
+    end
+
+    function BaseBridge:Destroy()
+        self.Connected = false
+
+        if self.Connections then
+            for _, connection in self.Connections do
+                pcall(function()
+                    connection:Disconnect()
+                end)
+            end
+            table.clear(self.Connections)
+        end
+
+        if self.Threads then
+            for _, thread in self.Threads do
+                pcall(task.cancel, thread)
+            end
+            table.clear(self.Threads)
+        end
+
+        if self.WebSocket then
+            pcall(function()
+                self.WebSocket:Close()
+            end)
+        end
     end
     
     function BaseBridge:IsAlive()
@@ -184,23 +286,27 @@ local WebSocketBridge = setmetatable({}, {__index = BaseBridge}); do
     
     function WebSocketBridge.new()
         local self = setmetatable({}, WebSocketBridge)
+        self.Callbacks = {}
+        self.Connections = {}
+        self.Threads = {}
     
         --// Yield until the server is alive \\--
-        while not self:IsAlive() do
+        while IsConnectorActive() and not self:IsAlive() do
             task.wait(0.1)
         end
+
+        assert(IsConnectorActive(), "Connector stopped")
     
         --// Connect to the server \\--
         self.WebSocket = WebSocket.connect("ws://" .. BridgeURL)
         self.Connected = true
-        self.Callbacks = {}
         self.ClientId = nil
 
         --// Send registration \\--
         self.WebSocket:Send(HttpService:JSONEncode(GetRegistrationInfo()))
 
-        self.AliveThread = task.spawn(function()
-            while task.wait(1) do
+        self.AliveThread = self:TrackThread(task.spawn(function()
+            while IsConnectorActive() and task.wait(1) do
                 if not self.Connected then
                     break
                 end
@@ -216,10 +322,14 @@ local WebSocketBridge = setmetatable({}, {__index = BaseBridge}); do
             pcall(function()
                 self.WebSocket:Close()
             end)
-        end)
+        end))
     
         --// On Message \\--
-        self.WebSocket.OnMessage:Connect(function(message)
+        self:TrackConnection(self.WebSocket.OnMessage:Connect(function(message)
+            if not IsConnectorActive() or not self.Connected then
+                return
+            end
+
             local data = HttpService:JSONDecode(message)
 
             --// Handle registration response \\--
@@ -232,18 +342,18 @@ local WebSocketBridge = setmetatable({}, {__index = BaseBridge}); do
             if response then
                 self.WebSocket:Send(HttpService:JSONEncode(response))
             end
-        end)
+        end))
     
         --// On Close \\--
-        self.WebSocket.OnClose:Connect(function()
+        self:TrackConnection(self.WebSocket.OnClose:Connect(function()
             self.Connected = false
-        end)
+        end))
     
         return self
     end
     
     function WebSocketBridge:WaitForDisconnect()
-        while self.Connected do
+        while IsConnectorActive() and self.Connected do
             task.wait(0.1)
         end
     end
@@ -255,14 +365,18 @@ local HTTPBridge = setmetatable({}, {__index = BaseBridge}); do
     
     function HTTPBridge.new()
         local self = setmetatable({}, HTTPBridge)
+        self.Callbacks = {}
+        self.Connections = {}
+        self.Threads = {}
     
         --// Yield until the server is alive \\--
-        while not self:IsAlive() do
+        while IsConnectorActive() and not self:IsAlive() do
             task.wait(0.1)
         end
+
+        assert(IsConnectorActive(), "Connector stopped")
     
         self.Connected = true
-        self.Callbacks = {}
         self.PollInterval = 0.1
         self.ClientId = nil
 
@@ -281,15 +395,16 @@ local HTTPBridge = setmetatable({}, {__index = BaseBridge}); do
         end)
     
         --// Start polling thread \\--
-        self.PollThread = task.spawn(function()
+        self.PollThread = self:TrackThread(task.spawn(function()
             local consecutiveFailures = 0
-            
-            while self.Connected do
+
+            while IsConnectorActive() and self.Connected do
                 local success, _ = pcall(function()
                     local pollUrl = "http://" .. BridgeURL .. "/poll"
                     if self.ClientId then
                         pollUrl = pollUrl .. "?clientId=" .. self.ClientId
                     end
+
                     local response = request({
                         Url = pollUrl,
                         Method = "GET"
@@ -304,17 +419,17 @@ local HTTPBridge = setmetatable({}, {__index = BaseBridge}); do
 
                         return
                     end
-                    
+
                     consecutiveFailures = 0
-    
+
                     --// Handle response \\--
                     if response.Body and response.Body ~= "" then
                         local data = HttpService:JSONDecode(response.Body)
                         if data == nil or data.type == nil then return end
-                        
+
                         local result = self:HandleMessage(data)
                         if result == nil then return end
-                        
+
                         --// Send response back \\--
                         request({
                             Url = "http://" .. BridgeURL .. "/respond",
@@ -326,23 +441,23 @@ local HTTPBridge = setmetatable({}, {__index = BaseBridge}); do
                         })
                     end
                 end)
-    
+
                 if not success then
                     consecutiveFailures += 1
                     if consecutiveFailures >= 3 then
                         self.Connected = false
                     end
                 end
-    
+
                 task.wait(self.PollInterval)
             end
-        end)
+        end))
     
         return self
     end
     
     function HTTPBridge:WaitForDisconnect()
-        while self.Connected do
+        while IsConnectorActive() and self.Connected do
             task.wait(0.1)
         end
     end
@@ -355,9 +470,13 @@ local function CreateBridge()
             return WebSocketBridge.new()
         end)
         
-        if success then
+        if success and bridge then
             return bridge
         end
+    end
+
+    if not IsConnectorActive() then
+        return nil
     end
 
     return HTTPBridge.new()
@@ -365,10 +484,94 @@ end
 
 --// Script Source Mapping \\--
 local PRELOAD_SCRIPT_SOURCES = getgenv().PreloadScriptSources == true
+local MAX_SCRIPT_SOURCE_CACHE_ENTRIES = math.max(tonumber(getgenv().RobloxMCPMaxScriptSourceCacheEntries) or 128, 25)
+local MAX_SCRIPT_SOURCE_CACHE_BYTES = math.max(tonumber(getgenv().RobloxMCPMaxScriptSourceCacheBytes) or (8 * 1024 * 1024), 262144)
+local SCRIPT_SOURCE_CACHE_TTL = math.max(tonumber(getgenv().RobloxMCPScriptSourceCacheTTL) or 600, 60)
+local DESTROYED_SCRIPT_CACHE_GRACE = math.max(tonumber(getgenv().RobloxMCPDestroyedScriptCacheGrace) or 120, 15)
 local ScriptSourcesMap = {}
+local ScriptSourceCacheMeta = {}
+local ScriptSourceCacheBytes = 0
 
 local ScriptInstanceMap = setmetatable({}, { __mode = "v" })
 local SourcesToMap, MappedSources = 0, 0
+
+local function GetScriptSourceCacheCount()
+    local count = 0
+    for _ in ScriptSourceCacheMeta do
+        count += 1
+    end
+    return count
+end
+
+local function RemoveCachedScriptSource(debugId)
+    local meta = ScriptSourceCacheMeta[debugId]
+    if meta then
+        ScriptSourceCacheBytes = math.max(0, ScriptSourceCacheBytes - meta.Size)
+    end
+
+    ScriptSourceCacheMeta[debugId] = nil
+    ScriptSourcesMap[debugId] = nil
+end
+
+local function TouchCachedScriptSource(debugId)
+    local meta = ScriptSourceCacheMeta[debugId]
+    if meta then
+        meta.LastAccess = os.clock()
+        meta.DestroyedAt = nil
+    end
+end
+
+local function PruneScriptSourceCache(force)
+    local now = os.clock()
+
+    for debugId, meta in ScriptSourceCacheMeta do
+        local isExpired = now - meta.LastAccess >= SCRIPT_SOURCE_CACHE_TTL
+        local destroyedTooLong = meta.DestroyedAt and (now - meta.DestroyedAt) >= DESTROYED_SCRIPT_CACHE_GRACE
+        if isExpired or destroyedTooLong or force then
+            RemoveCachedScriptSource(debugId)
+        end
+    end
+
+    local cacheCount = GetScriptSourceCacheCount()
+    while cacheCount > MAX_SCRIPT_SOURCE_CACHE_ENTRIES or ScriptSourceCacheBytes > MAX_SCRIPT_SOURCE_CACHE_BYTES do
+        local oldestDebugId = nil
+        local oldestAccess = math.huge
+
+        for debugId, meta in ScriptSourceCacheMeta do
+            if meta.LastAccess < oldestAccess then
+                oldestAccess = meta.LastAccess
+                oldestDebugId = debugId
+            end
+        end
+
+        if oldestDebugId == nil then
+            break
+        end
+
+        RemoveCachedScriptSource(oldestDebugId)
+        cacheCount -= 1
+    end
+end
+
+local function CacheScriptSource(debugId, source)
+    if typeof(source) ~= "string" then
+        return
+    end
+
+    if ScriptSourcesMap[debugId] then
+        RemoveCachedScriptSource(debugId)
+    end
+
+    ScriptSourcesMap[debugId] = source
+    ScriptSourceCacheMeta[debugId] = {
+        Size = #source,
+        LastAccess = os.clock(),
+        DestroyedAt = nil,
+    }
+    ScriptSourceCacheBytes += #source
+
+    PruneScriptSourceCache(false)
+end
 
 local function TrackScriptInstance(script)
     local debugId = script:GetDebugId()
@@ -377,26 +580,40 @@ local function TrackScriptInstance(script)
         if ScriptInstanceMap[debugId] == script then
             ScriptInstanceMap[debugId] = nil
         end
+
+        local meta = ScriptSourceCacheMeta[debugId]
+        if meta then
+            meta.DestroyedAt = os.clock()
+        end
     end)
 end
 
 local function MapScriptSource(script)
+    if not IsConnectorActive() then
+        return nil
+    end
+
     local debugId = script:GetDebugId()
     if ScriptSourcesMap[debugId] then
         TrackScriptInstance(script)
+        TouchCachedScriptSource(debugId)
         return ScriptSourcesMap[debugId]
     end
 
     TrackScriptInstance(script)
 
     for attempt = 1, 3 do
+        if not IsConnectorActive() then
+            return nil
+        end
+
         local success, decompOutput = pcall(decompile, script)
         if not success then
             task.wait(0.5)
             continue
         end
     
-        ScriptSourcesMap[debugId] = decompOutput
+        CacheScriptSource(debugId, decompOutput)
         MappedSources += 1
         break
     end
@@ -440,6 +657,7 @@ end
 local function GetScriptByDebugId(debugId)
     local CachedInstance = ScriptInstanceMap[debugId]
     if CachedInstance then
+        TouchCachedScriptSource(debugId)
         return CachedInstance
     end
 
@@ -448,6 +666,7 @@ local function GetScriptByDebugId(debugId)
         if script:GetDebugId() ~= debugId then continue end
         
         ScriptInstanceMap[debugId] = script
+        TouchCachedScriptSource(debugId)
         return script
     end
 
@@ -458,6 +677,7 @@ local function GetScriptByDebugId(debugId)
         if script:GetDebugId() ~= debugId then continue end
         
         ScriptInstanceMap[debugId] = script
+        TouchCachedScriptSource(debugId)
         return script
     end
 
@@ -465,20 +685,21 @@ local function GetScriptByDebugId(debugId)
 end
 
 do
-    game.DescendantAdded:Connect(function(script)
+    TrackRuntimeConnection(game.DescendantAdded:Connect(function(script)
         if not script:IsA("LuaSourceContainer") then
             return
         end
 
+        if not IsConnectorActive() then return end
         if not ShouldMapScript(script) then return end
         TrackScriptInstance(script)
 
         if PRELOAD_SCRIPT_SOURCES then
             task.defer(MapScriptSource, script)
         end
-    end)
+    end))
 
-    task.spawn(function()
+    TrackRuntimeThread(task.spawn(function()
         local ValidScripts = EnumerateMappableScripts()
 
         SourcesToMap = #ValidScripts
@@ -495,7 +716,14 @@ do
             task.defer(MapScriptSource, scriptObject)
             if idx % 50 == 0 then task.wait(0.1) end
         end
-    end)
+    end))
+
+    TrackRuntimeThread(task.spawn(function()
+        while IsConnectorActive() do
+            task.wait(30)
+            PruneScriptSourceCache(false)
+        end
+    end))
 end
 
 --// Parse Query \\--
@@ -597,8 +825,18 @@ local function ParseQuery(query)
 end
 
 --// Main Loop \\--
-while true do
-    local Bridge = CreateBridge()
+while IsConnectorActive() do
+    local ok, Bridge = pcall(CreateBridge)
+    if not ok or Bridge == nil then
+        if not IsConnectorActive() then
+            break
+        end
+
+        task.wait(1)
+        continue
+    end
+
+    ConnectorRuntime.ActiveBridge = Bridge
 
     Bridge:BindToType("execute", function(data)
         loadstring(data.source)()
@@ -610,6 +848,7 @@ while true do
         local logsOrder = data.logsOrder or "NewestFirst"
 
         local logs = LogService:GetLogHistory()
+        local totalLogs = #logs
         local results = {}
         
         if logsOrder == "NewestFirst" then
@@ -624,7 +863,7 @@ while true do
             end
         end
 
-        return { count = #LogService:GetLogHistory(), limited = #LogService:GetLogHistory() > limit, results = results }
+        return { count = totalLogs, limited = totalLogs > limit, results = results }
     end)
 
     Bridge:BindToType("get-data-by-code", function(data)
@@ -639,6 +878,7 @@ while true do
         if data.debugId then
             local cached = ScriptSourcesMap[data.debugId]
             assert(cached, "No cached source found for GC'd ScriptProxy with DebugId: " .. tostring(data.debugId))
+            TouchCachedScriptSource(data.debugId)
             return cached
         end
 
@@ -1337,5 +1577,17 @@ while true do
     end)
 
     Bridge:WaitForDisconnect()
+
+    if ConnectorRuntime.ActiveBridge == Bridge then
+        ConnectorRuntime.ActiveBridge = nil
+    end
+
+    pcall(function()
+        Bridge:Destroy()
+    end)
+
+    if IsConnectorActive() then
+        task.wait(0.25)
+    end
 end
 
