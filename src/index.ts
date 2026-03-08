@@ -1109,6 +1109,13 @@ function startAsPrimary(): Promise<void> {
       async (req: IncomingMessage, res: ServerResponse) => {
         const url = new URL(req.url || "/", `http://localhost:${WS_PORT}`);
 
+        // ── Lightweight health check (used by connector alive-check) ──
+        if (url.pathname === "/health" && req.method === "GET") {
+          res.writeHead(200, { "Content-Type": "text/plain" });
+          res.end("OK");
+          return;
+        }
+
         // ── Root status page ──
         if (url.pathname === "/" && req.method === "GET") {
           res.writeHead(200, { "Content-Type": "text/html" });

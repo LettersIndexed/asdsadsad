@@ -145,7 +145,7 @@ local BaseBridge = {}; do
             local response
             local thread = task.spawn(function()
                 local success, data = pcall(request, {
-                    Url = "http://" .. BridgeURL,
+                    Url = "http://" .. BridgeURL .. "/health",
                     Method = "GET"
                 })
 
@@ -201,7 +201,11 @@ local WebSocketBridge = setmetatable({}, {__index = BaseBridge}); do
 
         self.AliveThread = task.spawn(function()
             while task.wait(1) do
-                if self:IsAlive() or not self.Connected then
+                if not self.Connected then
+                    break
+                end
+
+                if self:IsAlive() then
                     continue
                 end
                 
