@@ -364,18 +364,32 @@ local function CreateBridge()
 end
 
 --// Script Source Mapping \\--
-local ScriptSourcesMap = {
-    HasFinishedMapping = false
-}
+local PRELOAD_SCRIPT_SOURCES = getgenv().PreloadScriptSources == true
+local ScriptSourcesMap = {}
 
 local ScriptInstanceMap = setmetatable({}, { __mode = "v" })
 local SourcesToMap, MappedSources = 0, 0
 
+local function TrackScriptInstance(script)
+    local debugId = script:GetDebugId()
+    ScriptInstanceMap[debugId] = script
+    script.Destroying:Once(function()
+        if ScriptInstanceMap[debugId] == script then
+            ScriptInstanceMap[debugId] = nil
+        end
+    end)
+end
+
 local function MapScriptSource(script)
     local debugId = script:GetDebugId()
-    if ScriptSourcesMap[debugId] then return end
+    if ScriptSourcesMap[debugId] then
+        TrackScriptInstance(script)
+        return ScriptSourcesMap[debugId]
+    end
 
-    for attempt = 1, 10 do
+    TrackScriptInstance(script)
+
+    for attempt = 1, 3 do
         local success, decompOutput = pcall(decompile, script)
         if not success then
             task.wait(0.5)
@@ -387,10 +401,40 @@ local function MapScriptSource(script)
         break
     end
 
-    ScriptInstanceMap[debugId] = script
-    script.Destroying:Once(function()
-        ScriptInstanceMap[debugId] = nil
-    end)
+    return ScriptSourcesMap[debugId]
+end
+
+local function ShouldMapScript(script)
+    local IsServerScript = script:IsA("Script") and script.RunContext == Enum.RunContext.Server
+    if IsServerScript then return false end
+
+    local IsRobloxScript = script.RobloxLocked or script:IsDescendantOf(CoreGui) or script:IsDescendantOf(CorePackages)
+    if IsRobloxScript then return false end
+
+    local HasBytecode = pcall(getscriptbytecode, script)
+    if not HasBytecode then return false end
+
+    return true
+end
+
+local function EnumerateMappableScripts()
+    local validScripts = {}
+
+    for _, script in game:QueryDescendants("LuaSourceContainer") do
+        if not script:IsA("LuaSourceContainer") then continue end
+        if not ShouldMapScript(script) then continue end
+
+        table.insert(validScripts, script)
+    end
+
+    for _, script in getnilinstances() do
+        if not script:IsA("LuaSourceContainer") then continue end
+        if not ShouldMapScript(script) then continue end
+
+        table.insert(validScripts, script)
+    end
+
+    return validScripts
 end
 
 local function GetScriptByDebugId(debugId)
@@ -421,56 +465,36 @@ local function GetScriptByDebugId(debugId)
 end
 
 do
-    local function ShouldMapScript(script)        
-        local IsServerScript = script:IsA("Script") and script.RunContext == Enum.RunContext.Server
-        if IsServerScript then return false end
-
-        local IsRobloxScript = script.RobloxLocked or script:IsDescendantOf(CoreGui) or script:IsDescendantOf(CorePackages)
-        if IsRobloxScript then return false end
-
-        local IsAlreadyMapped = ScriptSourcesMap[script:GetDebugId()]
-        if IsAlreadyMapped then return false end
-
-        local HasBytecode = pcall(getscriptbytecode, script)
-        if not HasBytecode then return false end
-
-        return true
-    end
-
     game.DescendantAdded:Connect(function(script)
         if not script:IsA("LuaSourceContainer") then
             return
         end
 
         if not ShouldMapScript(script) then return end
-        MapScriptSource(script)
+        TrackScriptInstance(script)
+
+        if PRELOAD_SCRIPT_SOURCES then
+            task.defer(MapScriptSource, script)
+        end
     end)
 
-    local CategoriesToMap = {
-        game:QueryDescendants("LuaSourceContainer"),
-        getnilinstances()
-    }
-
-    --// Map script sources \\--
     task.spawn(function()
-        local ValidScripts = {}
-        for _, category in CategoriesToMap do
-            for _, script in category do
-                if not script:IsA("LuaSourceContainer") then continue end
-                if not ShouldMapScript(script) then continue end
-
-                table.insert(ValidScripts, script)
-            end
-        end
+        local ValidScripts = EnumerateMappableScripts()
 
         SourcesToMap = #ValidScripts
 
-        for idx, scriptObject in ValidScripts do
-            task.defer(MapScriptSource, scriptObject)
-            if idx % 250 == 0 then task.wait(0.1) end
+        if not PRELOAD_SCRIPT_SOURCES then
+            for idx, scriptObject in ValidScripts do
+                TrackScriptInstance(scriptObject)
+                if idx % 500 == 0 then task.wait() end
+            end
+            return
         end
 
-        ScriptSourcesMap.HasFinishedMapping = true
+        for idx, scriptObject in ValidScripts do
+            task.defer(MapScriptSource, scriptObject)
+            if idx % 50 == 0 then task.wait(0.1) end
+        end
     end)
 end
 
@@ -949,8 +973,6 @@ while true do
     end)
 
     Bridge:BindToType("search-scripts-sources", function(data)
-        assert(ScriptSourcesMap.HasFinishedMapping, "The bridge is still mapping all script sources (" .. tostring(MappedSources) .. "/" .. tostring(SourcesToMap) .. ") please try again later.")
-
         local stringMatchQueries = ParseQuery(data.query)
         local limit = data.limit or 50
         local contextLines = data.contextLines or 2
@@ -980,14 +1002,20 @@ while true do
         --// Filter scripts that we need to process (search) \\--
         local matchingScripts = {}
         local count = 0
-        
-        for debugId, source in ScriptSourcesMap do
-            if debugId == "HasFinishedMapping" then continue end
+
+        for _, script in EnumerateMappableScripts() do
             if #matchingScripts >= limit then break end
+
+            local debugId = script:GetDebugId()
+            local source = ScriptSourcesMap[debugId]
+            if not source then
+                source = MapScriptSource(script)
+            end
+            if not source then continue end
 
             --// Rate limit \\--
             count += 1
-            if count % 200 == 0 then task.wait() end
+            if count % 10 == 0 then task.wait() end
 
             --// Pre-check \\--
             local hasAnyPotentialMatch = false
